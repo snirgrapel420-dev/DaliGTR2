@@ -1,0 +1,103 @@
+name: Build DaliGuitar
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  test:
+    name: Engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # the engine is header-only (Source/Engine/*.h) -> no Engine.cpp, no JUCE needed
+      - name: Build & run engine tests
+        run: g++ -std=c++17 -O2 -Wall -ISource/Engine tests/engine_test.cpp -o engine_test && ./engine_test
+
+  build:
+    name: ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            # no -G: CMake picks whichever Visual Studio the runner has (2022 / 2026 ...)
+            cmake_args: -A x64
+          - name: macOS
+            os: macos-latest
+            cmake_args: -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # JUCE is fetched by CMake; cache it so later builds are much faster
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 4
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $art = "build/DaliGuitar_artefacts/${{ env.BUILD_TYPE }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$art/VST3/DaliGuitar.vst3" -DestinationPath "dist/DaliGuitar-Windows-VST3.zip"
+          Compress-Archive -Path "$art/Standalone/DaliGuitar.exe" -DestinationPath "dist/DaliGuitar-Windows-Standalone.zip"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ART="build/DaliGuitar_artefacts/${{ env.BUILD_TYPE }}"
+          mkdir -p dist
+          # ad-hoc signature so the bundle loads on Apple Silicon
+          codesign --force --deep -s - "$ART/VST3/DaliGuitar.vst3"
+          codesign --force --deep -s - "$ART/Standalone/DaliGuitar.app"
+          ditto -c -k --keepParent "$ART/VST3/DaliGuitar.vst3" dist/DaliGuitar-macOS-VST3.zip
+          ditto -c -k --keepParent "$ART/Standalone/DaliGuitar.app" dist/DaliGuitar-macOS-Standalone.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaliGuitar-${{ matrix.name }}
+          path: dist/*.zip
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
